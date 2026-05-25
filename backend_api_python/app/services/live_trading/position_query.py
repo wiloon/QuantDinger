@@ -209,7 +209,7 @@ def query_exchange_position_size(
                 return qty
         return 0.0
 
-    # IBKR / Alpaca broker clients.
+    # MT5 / IBKR / Alpaca (desktop brokers)
     try:
         positions = client.get_positions() if hasattr(client, "get_positions") else []
     except Exception:

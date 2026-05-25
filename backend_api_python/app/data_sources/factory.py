@@ -168,7 +168,7 @@ class DataSourceFactory:
             return cls.get_source("Crypto")
         if key in ("futures",):
             return cls.get_source("Futures")
-        if key in ("forex", "fx"):
+        if key in ("forex", "fx", "mt5"):
             return cls.get_source("Forex")
         if key in ("usstock", "us_stocks", "stock", "stocks", "ibkr", "alpaca"):
             return cls.get_source("USStock")

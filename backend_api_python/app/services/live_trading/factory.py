@@ -258,6 +258,12 @@ def create_client(exchange_config: Dict[str, Any], *, market_type: str = "swap")
         # This factory only creates clients based on exchange_id
         return create_ibkr_client(exchange_config)
 
+    # Forex brokers (MT5 for Forex only)
+    if exchange_id == "mt5":
+        # Note: Market category validation should be done at the caller level
+        # This factory only creates clients based on exchange_id
+        return create_mt5_client(exchange_config)
+
     # Alpaca: REST broker for US stocks + crypto (no local terminal needed).
     # Caller is responsible for validating market_category in (USStock, Crypto).
     if exchange_id == "alpaca":
@@ -324,6 +330,85 @@ def create_ibkr_client(exchange_config: Dict[str, Any]):
     # Connect immediately (IBKR requires active connection)
     if not client.connect():
         raise LiveTradingError("Failed to connect to IBKR TWS/Gateway. Please check if it's running.")
+
+    return client
+
+
+def create_mt5_client(exchange_config: Dict[str, Any]):
+    """
+    Create MT5 client for forex trading.
+
+    exchange_config should contain:
+    - mt5_login: MT5 account number
+    - mt5_password: MT5 password
+    - mt5_server: Broker server name (e.g., "ICMarkets-Demo")
+    - mt5_terminal_path: Optional path to terminal64.exe
+    - market_category: Must be "Forex" (validated)
+    
+    Note: MT5 is ONLY for Forex trading, not for Crypto or Stocks.
+    """
+    from app.services.mt5_trading.broker_client import create_mt5_broker_client, use_mt5_gateway
+
+    # Validate market category - MT5 is ONLY for Forex
+    market_category = str(exchange_config.get("market_category") or "").strip()
+    if market_category and market_category != "Forex":
+        raise LiveTradingError(
+            f"MT5 can only be used for Forex trading, but market_category is '{market_category}'. "
+            f"MT5 does not support Crypto or Stock trading. Please use MT5 only with Forex market."
+        )
+
+    from app.services.mt5_trading.client import MT5Config
+
+    # Handle login as int (may come as string from JSON)
+    login_raw = exchange_config.get("mt5_login") or 0
+    try:
+        login = int(login_raw) if login_raw else 0
+    except (ValueError, TypeError):
+        # Try converting string to int
+        try:
+            login = int(str(login_raw).strip())
+        except (ValueError, TypeError):
+            login = 0
+    
+    password = str(exchange_config.get("mt5_password") or "").strip()
+    server = str(exchange_config.get("mt5_server") or "").strip()
+    terminal_path = str(exchange_config.get("mt5_terminal_path") or "").strip()
+
+    if not login or not password or not server:
+        raise LiveTradingError("MT5 requires login, password, and server")
+
+    config = MT5Config(
+        login=login,
+        password=password,
+        server=server,
+        terminal_path=terminal_path,
+    )
+
+    try:
+        client = create_mt5_broker_client(config)
+    except Exception as e:
+        if use_mt5_gateway():
+            raise LiveTradingError(f"Failed to create MT5 gateway client: {e}") from e
+        raise LiveTradingError(
+            "MT5 trading requires MetaTrader5 library. Run: pip install MetaTrader5\n"
+            "Note: This library only works on Windows, or set MT5_GATEWAY_URL."
+        ) from e
+
+    # Connect immediately
+    if not client.connect():
+        if use_mt5_gateway():
+            raise LiveTradingError(
+                "Failed to connect via MT5 gateway. Please check:\n"
+                "1. mt5_gateway is running on Windows\n"
+                "2. MT5_GATEWAY_URL and MT5_GATEWAY_API_KEY match the gateway\n"
+                "3. MT5 terminal is running and credentials are correct"
+            )
+        raise LiveTradingError(
+            "Failed to connect to MT5 terminal. Please check:\n"
+            "1. MT5 terminal is running\n"
+            "2. Credentials are correct\n"
+            "3. You are on Windows"
+        )
 
     return client
 

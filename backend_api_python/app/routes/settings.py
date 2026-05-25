@@ -638,7 +638,7 @@ CONFIG_SCHEMA = {
             },
             {
                 'key': 'ALLOW_LOCAL_DESKTOP_BROKERS',
-                'label': 'Allow IBKR (local desktop broker)',
+                'label': 'Allow IBKR / MT5 (local desktop brokers)',
                 'type': 'boolean',
                 'default': 'True',
                 'description': 'Disable on a multi-tenant SaaS deployment so users see a clear "broker not supported" message instead of broken connect flows. Crypto exchange API keys are unaffected.'

@@ -289,6 +289,17 @@ def place_order_from_signal(
             exchange_config=exchange_config,
         )
 
+    from app.services.mt5_trading.protocol import is_mt5_broker_client
+
+    if is_mt5_broker_client(client):
+        return _place_mt5_order(
+            client=client,
+            signal_type=signal_type,
+            symbol=symbol,
+            amount=qty,
+            exchange_config=exchange_config,
+        )
+
     # Check for Alpaca client (US stocks + crypto via REST)
     global AlpacaClient
     if AlpacaClient is None:
@@ -361,6 +372,64 @@ def _place_ibkr_order(
         raw={
             "status": result.status,
             "message": result.message,
+            "raw": result.raw,
+        },
+    )
+
+
+def _place_mt5_order(
+    client,
+    *,
+    signal_type: str,
+    symbol: str,
+    amount: float,
+    exchange_config: Optional[Dict[str, Any]] = None,
+) -> LiveOrderResult:
+    """
+    Place order via MT5 for forex trading.
+
+    Signal mapping for forex:
+    - open_long / add_long -> BUY
+    - close_long / reduce_long -> SELL
+    - open_short / add_short -> SELL
+    - close_short / reduce_short -> BUY
+    """
+    sig = (signal_type or "").strip().lower()
+
+    # Determine action based on signal
+    if sig in ("open_long", "add_long"):
+        action = "buy"
+    elif sig in ("close_long", "reduce_long"):
+        action = "sell"
+    elif sig in ("open_short", "add_short"):
+        action = "sell"
+    elif sig in ("close_short", "reduce_short"):
+        action = "buy"
+    else:
+        raise LiveTradingError(f"Unsupported signal_type for MT5: {signal_type}")
+
+    # Normalize symbol before placing order (MT5 requires specific format)
+    from app.services.mt5_trading.symbols import normalize_symbol
+    normalized_symbol = normalize_symbol(symbol)
+
+    # Place market order
+    result = client.place_market_order(
+        symbol=normalized_symbol,
+        side=action,
+        volume=amount,
+        comment="QuantDinger",
+    )
+
+    # Convert MT5Client result to LiveOrderResult format
+    return LiveOrderResult(
+        success=result.success,
+        exchange_order_id=str(result.order_id) if result.order_id else "",
+        filled=result.filled,
+        avg_price=result.price,
+        raw={
+            "status": result.status,
+            "message": result.message,
+            "deal_id": result.deal_id,
             "raw": result.raw,
         },
     )

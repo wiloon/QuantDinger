@@ -112,22 +112,56 @@ class StrategyService:
 
             ex = str(exchange_id or "").strip().lower()
 
-            # IBKR is not a CCXT exchange; do not fall through to crypto symbol list.
-            if ex == "ibkr":
+            # IBKR / MT5 are not CCXT exchanges; do not fall through to crypto symbol list.
+            if ex in ("ibkr", "mt5"):
                 from app.utils.local_brokers import desktop_broker_cloud_reject_message, local_desktop_brokers_allowed
 
                 if not local_desktop_brokers_allowed():
                     return {"success": False, "message": desktop_broker_cloud_reject_message(), "symbols": []}
 
-                common = [
-                    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AMD", "NFLX", "INTC",
-                    "SPY", "QQQ", "IWM", "DIA", "VOO", "BABA", "JD", "PDD", "COIN", "MSTR",
-                ]
-                return {
-                    "success": True,
-                    "message": "IBKR common US stock symbols. You may also enter another tradable TWS symbol manually.",
-                    "symbols": common,
-                }
+                if ex == "ibkr":
+                    # US tickers for convenience; full universe is broker-side.
+                    common = [
+                        "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AMD", "NFLX", "INTC",
+                        "SPY", "QQQ", "IWM", "DIA", "VOO", "BABA", "JD", "PDD", "COIN", "MSTR",
+                    ]
+                    return {
+                        "success": True,
+                        "message": "IBKR common US stock symbols. You may also enter another tradable TWS symbol manually.",
+                        "symbols": common,
+                    }
+
+                if ex == "mt5":
+                    try:
+                        from app.services.live_trading.factory import create_mt5_client
+
+                        mt5_client = create_mt5_client(resolved)
+                        if mt5_client and mt5_client.connected:
+                            infos = mt5_client.get_symbols(group="*") or []
+                            names: List[str] = []
+                            for info in infos:
+                                if isinstance(info, dict):
+                                    n = str(info.get("name") or "").strip()
+                                    if n:
+                                        names.append(n)
+                            names = sorted(set(names))[:2000]
+                            return {
+                                "success": True,
+                                "message": f"MT5: {len(names)} symbols from terminal",
+                                "symbols": names,
+                            }
+                        return {
+                            "success": False,
+                            "message": "MT5 not connected. Please make sure the MT5 terminal is running locally and the account is configured correctly.",
+                            "symbols": [],
+                        }
+                    except Exception as e:
+                        logger.error(f"MT5 get_symbols failed: {e}")
+                        return {
+                            "success": False,
+                            "message": f"MT5 symbol list failed: {e}",
+                            "symbols": [],
+                        }
 
             # For these exchanges, prefer direct REST (no ccxt), aligned with local live-trading design.
             if ex in ("bybit", "coinbaseexchange", "coinbase_exchange", "kraken", "gate"):
@@ -292,7 +326,7 @@ class StrategyService:
                 if not exchange_id:
                     return {'success': False, 'message': 'Missing exchange_id', 'data': None}
 
-                if exchange_id == "ibkr":
+                if exchange_id in ("ibkr", "mt5"):
                     from app.utils.local_brokers import desktop_broker_cloud_reject_message, local_desktop_brokers_allowed
 
                     if not local_desktop_brokers_allowed():
@@ -301,6 +335,50 @@ class StrategyService:
                             "message": desktop_broker_cloud_reject_message(),
                             "data": {"exchange": safe_cfg},
                         }
+
+                # Handle MT5 (Forex) connection test
+                if exchange_id == 'mt5':
+                    # Validate that MT5 is only used for Forex market
+                    market_category = str(resolved.get("market_category") or exchange_config.get("market_category") or "").strip()
+                    if market_category and market_category != "Forex":
+                        return {
+                            'success': False,
+                            'message': f'MT5 can only be used for Forex trading, but market_category is {market_category}. Please use MT5 only with Forex market.',
+                            'data': {'exchange': safe_cfg}
+                        }
+
+                    try:
+                        from app.services.live_trading.factory import create_mt5_client
+                        mt5_client = create_mt5_client(resolved)
+                        if mt5_client and mt5_client.connected:
+                            # Get account info if available
+                            account_info = None
+                            try:
+                                account_info = mt5_client.get_account_info()
+                            except Exception:
+                                pass
+                            return {
+                                'success': True,
+                                'message': 'MT5 connection successful',
+                                'data': {
+                                    'exchange': safe_cfg,
+                                    'account': account_info
+                                }
+                            }
+                        else:
+                            return {
+                                'success': False,
+                                'message': 'Failed to connect to MT5. Please check credentials and ensure terminal is running.',
+                                'data': {'exchange': safe_cfg}
+                            }
+                    except Exception as e:
+                        error_msg = str(e)
+                        return {
+                            'success': False,
+                            'message': f'MT5 connection failed: {error_msg}',
+                            'data': {'exchange': safe_cfg}
+                        }
+
                 # Handle IBKR (US Stocks) connection test
                 if exchange_id == 'ibkr':
                     market_category_ib = str(

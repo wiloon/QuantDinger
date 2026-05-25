@@ -336,6 +336,8 @@ class PendingOrderWorker:
                 # Lazy import IBKR / Alpaca clients here so the elif chain
                 # below can rely on isinstance() checks without paying the import
                 # cost on systems that don't ship those broker libs.
+                from app.services.mt5_trading.protocol import is_mt5_broker_client
+
                 global IBKRClient
                 if IBKRClient is None:
                     try:
@@ -622,6 +624,26 @@ class PendingOrderWorker:
                                         exch_entry_price.setdefault(sym, {"long": 0.0, "short": 0.0})[side] = ep
                                 except Exception:
                                     pass
+
+                    elif is_mt5_broker_client(client):
+                        # MT5 forex positions
+                        positions = client.get_positions()
+                        if isinstance(positions, list):
+                            for p in positions:
+                                if not isinstance(p, dict):
+                                    continue
+                                sym = str(p.get("symbol") or "").strip()
+                                pos_type = str(p.get("type") or "").strip().lower()
+                                try:
+                                    vol = float(p.get("volume") or 0.0)
+                                except Exception:
+                                    vol = 0.0
+                                if not sym or vol <= 0:
+                                    continue
+                                # MT5: type "buy" = long, "sell" = short
+                                side = "long" if pos_type == "buy" else "short"
+                                exch_size.setdefault(sym, {"long": 0.0, "short": 0.0})[side] = float(vol)
+                        # Continue to reconciliation logic below
 
                     elif IBKRClient is not None and isinstance(client, IBKRClient):
                         # IBKR US-stock positions. `quantity` is signed: >0 = long, <0 = short.
@@ -1495,6 +1517,23 @@ class PendingOrderWorker:
             )
             return
 
+        from app.services.mt5_trading.protocol import is_mt5_broker_client
+
+        if is_mt5_broker_client(client):
+            # Execute MT5 order (separate flow for forex)
+            self._execute_mt5_order(
+                order_id=order_id,
+                order_row=order_row,
+                payload=payload,
+                client=client,
+                strategy_id=strategy_id,
+                exchange_config=exchange_config,
+                _notify_live_best_effort=_notify_live_best_effort,
+                _console_print=_console_print,
+            )
+            return
+
+        # Check if this is an Alpaca client (US stocks + crypto via REST)
         global AlpacaClient
         if AlpacaClient is None:
             try:
@@ -2339,6 +2378,152 @@ class PendingOrderWorker:
             _console_print(f"[worker] Alpaca order exception: strategy_id={strategy_id} pending_id={order_id} err={e}")
             _notify_live_best_effort(status="failed", error=str(e))
             append_strategy_log(strategy_id, "error", f"Alpaca order exception ({symbol} {signal_type}): {e}")
+
+    def _execute_mt5_order(
+        self,
+        *,
+        order_id: int,
+        order_row: Dict[str, Any],
+        payload: Dict[str, Any],
+        client,  # MT5Client instance
+        strategy_id: int,
+        exchange_config: Dict[str, Any],
+        _notify_live_best_effort,
+        _console_print,
+    ) -> None:
+        """
+        Execute order via MetaTrader 5 for forex trading.
+
+        Simplified flow compared to crypto (no maker->market fallback):
+        - Place market order directly
+        - Wait for fill
+        - Record trade
+        """
+        signal_type = payload.get("signal_type") or order_row.get("signal_type")
+        symbol = payload.get("symbol") or order_row.get("symbol")
+        amount = float(payload.get("amount") or order_row.get("amount") or 0.0)
+        ref_price = float(payload.get("ref_price") or payload.get("price") or order_row.get("price") or 0.0)
+
+        sig = str(signal_type or "").strip().lower()
+
+        # Map signal to action (include stop/tp/trailing aliases)
+        if sig in ("open_long", "add_long"):
+            action = "buy"
+        elif sig in ("close_long", "reduce_long", "close_long_stop", "close_long_profit", "close_long_trailing"):
+            action = "sell"
+        elif sig in ("open_short", "add_short"):
+            action = "sell"
+        elif sig in ("close_short", "reduce_short", "close_short_stop", "close_short_profit", "close_short_trailing"):
+            action = "buy"
+        else:
+            self._mark_failed(order_id=order_id, error=f"mt5_unsupported_signal:{signal_type}")
+            _console_print(f"[worker] MT5 order rejected: strategy_id={strategy_id} pending_id={order_id} unsupported signal {signal_type}")
+            _notify_live_best_effort(status="failed", error=f"mt5_unsupported_signal:{signal_type}")
+            return
+
+        try:
+            # Ensure client is connected before placing order
+            if not client.connected:
+                logger.warning(f"MT5 client not connected, attempting reconnect: strategy_id={strategy_id}, pending_id={order_id}")
+                if not client.connect():
+                    self._mark_failed(order_id=order_id, error="mt5_connection_failed")
+                    _console_print(f"[worker] MT5 connection failed: strategy_id={strategy_id} pending_id={order_id}")
+                    _notify_live_best_effort(status="failed", error="mt5_connection_failed")
+                    return
+
+            # Normalize symbol before placing order (MT5 requires specific format)
+            from app.services.mt5_trading.symbols import normalize_symbol
+            normalized_symbol = normalize_symbol(symbol)
+
+            # Place market order via MT5
+            result = client.place_market_order(
+                symbol=normalized_symbol,
+                side=action,
+                volume=amount,
+                comment="QuantDinger",
+            )
+
+            if not result.success:
+                self._mark_failed(order_id=order_id, error=f"mt5_order_failed:{result.message}")
+                _console_print(f"[worker] MT5 order failed: strategy_id={strategy_id} pending_id={order_id} err={result.message}")
+                _notify_live_best_effort(status="failed", error=f"mt5_order_failed:{result.message}")
+                append_strategy_log(strategy_id, "error", f"MT5 order failed ({symbol} {signal_type}): {result.message}")
+                return
+
+            filled = float(result.filled or 0.0)
+            avg_price = float(result.price or 0.0)
+            exchange_order_id = str(result.order_id or "")
+
+            if avg_price <= 0 and ref_price > 0:
+                logger.warning(f"[worker] MT5 order avg_price=0, using ref_price={ref_price} as fallback: strategy_id={strategy_id} pending_id={order_id}")
+                avg_price = ref_price
+            if filled <= 0:
+                logger.warning(f"[worker] MT5 order filled=0, using amount={amount} as fallback: strategy_id={strategy_id} pending_id={order_id}")
+                filled = amount
+
+            executed_at = int(time.time())
+
+            # Mark order as sent
+            self._mark_sent(
+                order_id=order_id,
+                note="mt5_order_sent",
+                exchange_id="mt5",
+                exchange_order_id=exchange_order_id,
+                exchange_response_json=json.dumps(result.raw or {}, ensure_ascii=False),
+                filled=filled,
+                avg_price=avg_price,
+                executed_at=executed_at,
+            )
+            _console_print(f"[worker] MT5 order sent: strategy_id={strategy_id} pending_id={order_id} order_id={exchange_order_id} filled={filled} avg={avg_price}")
+
+            # Record trade and update position
+            try:
+                if filled > 0 and avg_price > 0:
+                    logger.info(
+                        f"MT5 record begin: pending_id={order_id} strategy_id={strategy_id} symbol={symbol} "
+                        f"signal={signal_type} filled={filled} avg_price={avg_price}"
+                    )
+                    profit, _pos = apply_fill_to_local_position(
+                        strategy_id=strategy_id,
+                        symbol=str(symbol),
+                        signal_type=str(signal_type),
+                        filled=filled,
+                        avg_price=avg_price,
+                    )
+                    record_trade(
+                        strategy_id=strategy_id,
+                        symbol=str(symbol),
+                        trade_type=str(signal_type),
+                        price=avg_price,
+                        amount=filled,
+                        commission=0.0,  # MT5 commission is complex, skip for now
+                        commission_ccy="USD",
+                        profit=profit,
+                    )
+                    logger.info(f"MT5 record done: pending_id={order_id} strategy_id={strategy_id} symbol={symbol}")
+                    _pstr = f", profit={profit:.4f}" if profit is not None else ""
+                    append_strategy_log(
+                        strategy_id, "trade",
+                        f"Trade executed: {signal_type} {symbol} filled={filled:.6f} @ {avg_price:.6f}{_pstr} (exchange=mt5)",
+                    )
+            except Exception as e:
+                logger.warning(f"MT5 record_trade/update_position failed: pending_id={order_id}, err={e}")
+
+            # Notify success
+            _notify_live_best_effort(
+                status="sent",
+                exchange_id="mt5",
+                exchange_order_id=exchange_order_id,
+                price_hint=avg_price,
+                amount_hint=filled,
+            )
+
+        except Exception as e:
+            logger.error(f"MT5 order execution failed: pending_id={order_id}, strategy_id={strategy_id}, err={e}")
+            self._mark_failed(order_id=order_id, error=f"mt5_exception:{e}")
+            _console_print(f"[worker] MT5 order exception: strategy_id={strategy_id} pending_id={order_id} err={e}")
+            _notify_live_best_effort(status="failed", error=str(e))
+            append_strategy_log(strategy_id, "error", f"MT5 order exception ({symbol} {signal_type}): {e}")
 
     def _mark_sent(
         self,
